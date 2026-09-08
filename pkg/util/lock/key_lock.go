@@ -103,17 +103,7 @@ func (k *KeyLock[K]) TryLock(key K) bool {
 func (k *KeyLock[K]) Unlock(lockedKey K) {
 	k.keyLocksMutex.Lock()
 	defer k.keyLocksMutex.Unlock()
-	keyLock, ok := k.refLocks[lockedKey]
-	if !ok {
-		mlog.Warn(context.TODO(), "Unlocking non-existing key", mlog.Any("key", lockedKey))
-		return
-	}
-	keyLock.unref()
-	if keyLock.refCounter == 0 {
-		_ = refLockPoolPool.ReturnObject(ctx, keyLock)
-		delete(k.refLocks, lockedKey)
-	}
-	keyLock.mutex.Unlock()
+	k.releaseHeldLock(lockedKey, (*sync.RWMutex).Unlock)
 }
 
 // TryLockMany atomically acquires write locks for every key in keys, or acquires
@@ -146,13 +136,7 @@ func (k *KeyLock[K]) TryLockMany(keys []K) bool {
 	// unlockLocked releases a key this attempt already acquired, mirroring Unlock's
 	// ref-count/pool bookkeeping but assuming keyLocksMutex is already held.
 	unlockLocked := func(key K) {
-		keyLock := k.refLocks[key]
-		keyLock.unref()
-		if keyLock.refCounter == 0 {
-			_ = refLockPoolPool.ReturnObject(ctx, keyLock)
-			delete(k.refLocks, key)
-		}
-		keyLock.mutex.Unlock()
+		k.releaseHeldLock(key, (*sync.RWMutex).Unlock)
 	}
 	rollback := func(upto int) {
 		for j := upto - 1; j >= 0; j-- {
@@ -246,17 +230,7 @@ func (k *KeyLock[K]) UnlockMany(keys []K) {
 	k.keyLocksMutex.Lock()
 	defer k.keyLocksMutex.Unlock()
 	for _, key := range keys {
-		keyLock, ok := k.refLocks[key]
-		if !ok {
-			mlog.Warn(context.TODO(), "Unlocking non-existing key", mlog.Any("key", key))
-			continue
-		}
-		keyLock.unref()
-		if keyLock.refCounter == 0 {
-			_ = refLockPoolPool.ReturnObject(ctx, keyLock)
-			delete(k.refLocks, key)
-		}
-		keyLock.mutex.Unlock()
+		k.releaseHeldLock(key, (*sync.RWMutex).Unlock)
 	}
 }
 
@@ -319,17 +293,28 @@ func (k *KeyLock[K]) tryLockInternal(key K, tryLocker func(mutex *sync.RWMutex) 
 func (k *KeyLock[K]) RUnlock(lockedKey K) {
 	k.keyLocksMutex.Lock()
 	defer k.keyLocksMutex.Unlock()
-	keyLock, ok := k.refLocks[lockedKey]
+	k.releaseHeldLock(lockedKey, (*sync.RWMutex).RUnlock)
+}
+
+// releaseHeldLock drops one ref on a held key. The caller must hold
+// keyLocksMutex and own the corresponding write or read lock. The RWMutex is
+// released before the RefLock is returned to the process-wide pool; returning
+// a still-locked mutex lets another KeyLock instance borrow it and fail
+// TryLock/TryRLock on an uncontended key (#53161).
+func (k *KeyLock[K]) releaseHeldLock(key K, unlock func(*sync.RWMutex)) {
+	keyLock, ok := k.refLocks[key]
 	if !ok {
-		mlog.Warn(context.TODO(), "Unlocking non-existing key", mlog.Any("key", lockedKey))
+		mlog.Warn(context.TODO(), "Unlocking non-existing key", mlog.Any("key", key))
 		return
 	}
 	keyLock.unref()
 	if keyLock.refCounter == 0 {
+		delete(k.refLocks, key)
+		unlock(&keyLock.mutex)
 		_ = refLockPoolPool.ReturnObject(ctx, keyLock)
-		delete(k.refLocks, lockedKey)
+		return
 	}
-	keyLock.mutex.RUnlock()
+	unlock(&keyLock.mutex)
 }
 
 func (k *KeyLock[K]) size() int {

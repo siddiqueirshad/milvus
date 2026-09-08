@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -323,4 +324,94 @@ func TestLockManyOrderedConcurrentReversedInputs(t *testing.T) {
 	go worker([]int64{3, 2, 1})
 	wg.Wait()
 	assert.Zero(t, keyLock.size())
+}
+
+// TestTryLockNeverFailsOnUncontendedKeyAcrossKeyLockInstances pins the
+// process-wide RefLock pool contract: Unlock/RUnlock must release the mutex
+// before ReturnObject. Otherwise a different KeyLock instance can borrow a
+// still-locked mutex and TryLock/TryRLock fails even though that instance
+// holds no keys. See #53161 and #45285.
+func TestTryLockNeverFailsOnUncontendedKeyAcrossKeyLockInstances(t *testing.T) {
+	nWorkers := crossInstanceLockWorkers()
+	const iters = 20000
+
+	var tryLockFailures atomic.Int64
+	var tryRLockFailures atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(nWorkers)
+	for i := 0; i < nWorkers; i++ {
+		go func(id int) {
+			defer wg.Done()
+			k := NewKeyLock[int]()
+			key := id + 1
+			for j := 0; j < iters; j++ {
+				if !k.TryLock(key) {
+					tryLockFailures.Add(1)
+					k.Lock(key)
+				}
+				k.Unlock(key)
+
+				if !k.TryRLock(key) {
+					tryRLockFailures.Add(1)
+					k.RLock(key)
+				}
+				k.RUnlock(key)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	assert.Zero(t, tryLockFailures.Load(), "TryLock failed on an uncontended per-instance key; pooled RefLock was still locked")
+	assert.Zero(t, tryRLockFailures.Load(), "TryRLock failed on an uncontended per-instance key; pooled RefLock was still locked")
+}
+
+func TestTryLockManyNeverFailsOnUncontendedKeysAcrossKeyLockInstances(t *testing.T) {
+	nWorkers := crossInstanceLockWorkers()
+	const iters = 10000
+
+	var failures atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(nWorkers)
+	for i := 0; i < nWorkers; i++ {
+		go func(id int) {
+			defer wg.Done()
+			k := NewKeyLock[int]()
+			base := id * 3
+			keys := []int{base + 1, base + 2, base + 3}
+			for j := 0; j < iters; j++ {
+				if !k.TryLockMany(keys) {
+					failures.Add(1)
+					LockManyOrdered(k, keys)
+				}
+				k.UnlockMany(keys)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	assert.Zero(t, failures.Load(), "TryLockMany failed on uncontended per-instance keys; pooled RefLock was still locked")
+}
+
+func TestPooledRefLockCanBeTryLockedAfterUnlock(t *testing.T) {
+	k := NewKeyLock[string]()
+	k.Lock("seed")
+	k.Unlock("seed")
+
+	obj, err := refLockPoolPool.BorrowObject(ctx)
+	assert.NoError(t, err)
+	refLock := obj.(*RefLock)
+	assert.True(t, refLock.mutex.TryLock(), "RefLock borrowed from the pool after Unlock must not still be write-locked")
+	refLock.mutex.Unlock()
+	assert.NoError(t, refLockPoolPool.ReturnObject(ctx, refLock))
+}
+
+func crossInstanceLockWorkers() int {
+	nWorkers := runtime.GOMAXPROCS(0) * 4
+	if nWorkers < 8 {
+		return 8
+	}
+	if nWorkers > 16 {
+		return 16
+	}
+	return nWorkers
 }
